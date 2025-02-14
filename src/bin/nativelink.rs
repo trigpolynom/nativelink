@@ -1007,7 +1007,7 @@ async fn get_config() -> Result<CasConfig, Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing()?;
 
-    let mut cfg = futures::executor::block_on(get_config())?;
+    let mut cfg: CasConfig = futures::executor::block_on(get_config())?;
 
     let (mut metrics_enabled, max_blocking_threads) = {
         // Note: If the default changes make sure you update the documentation in

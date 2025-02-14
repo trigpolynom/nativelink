@@ -26,8 +26,7 @@
                       "max_retries": 6,
                       "delay": 0.3,
                       "jitter": 0.5
-                    },
-                    "additional_max_concurrent_requests": 10
+                    }
                   }
                 }
               }
@@ -58,8 +57,7 @@
                           "max_retries": 6,
                           "delay": 0.3,
                           "jitter": 0.5
-                        },
-                        "additional_max_concurrent_requests": 10
+                        }
                       }
                     }
                   }
@@ -99,8 +97,7 @@
               "max_retries": 6,
               "delay": 0.3,
               "jitter": 0.5
-            },
-            "additional_max_concurrent_requests": 10
+            }
           }
         }
       }

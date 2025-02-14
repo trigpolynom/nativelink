@@ -1,257 +1,150 @@
-// gcs_store.rs
+// Copyright 2024 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
-use tonic::{Request, Response, Status};
-use tonic::transport::{Channel, ClientTlsConfig};
-use async_stream::stream;
-
-// Import the generated GCS proto code. (Assume your Bazel build provides this.)
-use nativelink_proto::google::storage::v2::{
-    storage_client::StorageClient,
-    GetObjectRequest, Object,
-    WriteObjectRequest, WriteObjectResponse,
-    ReadObjectRequest, ReadObjectResponse,
+use futures::stream::unfold;
+use futures::TryStreamExt;
+use google_cloud_storage::google::storage::v2::storage_client::StorageClient;
+use nativelink_config::stores::GcsSpec;
+use nativelink_error::{make_err, Code, Error, ResultExt};
+use nativelink_metric::MetricsComponent;
+use nativelink_util::buf_channel::{
+    make_buf_channel_pair, DropCloserReadHalf, DropCloserWriteHalf,
 };
+use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
+use nativelink_util::instant_wrapper::InstantWrapper;
+use nativelink_util::retry::{Retrier, RetryResult};
+use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
+use rand::rngs::OsRng;
+use rand::Rng;
+use tokio::time::sleep;
+use tracing::{error, info};
 
-use crate::nativelink_error::{Error, Code, make_err};
-use crate::nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
-use crate::nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
-use crate::nativelink_util::retry::{Retrier, RetryResult};
+use crate::cas_utils::is_zero_digest;
 
-/// A GCS store that implements the StoreDriver trait using tonic gRPC.
-pub struct GCSStore<NowFn> {
-    /// The gRPC client for GCS.
-    client: StorageClient<Channel>,
-    /// The bucket in which to store objects.
-    bucket: String,
-    /// An optional key prefix that is prepended to every object name.
-    key_prefix: String,
-    /// A retrier for retryable RPC calls.
-    retrier: Retrier,
-    /// If nonzero, objects older than “now – consider_expired_after_s” are ignored.
-    consider_expired_after_s: i64,
-    /// A function that returns the current unix timestamp (in seconds).
-    now_fn: NowFn,
+// A placeholder for your retry configuration.
+#[derive(Clone)]
+pub struct RetrySpec {
+    pub jitter: f32,
+    // ... other retry parameters
 }
 
-impl<NowFn> GCSStore<NowFn>
+// We use the generated GCS client from the tonic build:
+use storage_client::StorageClient;
+
+// Our GCSStore struct, similar to the S3Store:
+#[derive(MetricsComponent)]
+pub struct GCSStore<NowFn, T> {
+    // The gRPC client for Google Cloud Storage.
+    gcs_client: Arc<StorageClient<T>>,
+    now_fn: NowFn,
+    #[metric(help = "The bucket name for the GCS store")]
+    bucket: String,
+    #[metric(help = "The key prefix for the GCS store")]
+    key_prefix: String,
+    retrier: Retrier,
+    #[metric(help = "The number of seconds to consider an object expired")]
+    consider_expired_after_s: i64,
+    #[metric(help = "The number of bytes to buffer for retrying requests")]
+    max_retry_buffer_per_request: usize,
+}
+
+impl<NowFn, T, I> GCSStore<NowFn, T>
 where
-    NowFn: Fn() -> i64 + Send + Sync + 'static,
+    // T is the underlying transport (typically a tonic Channel or similar).
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+    T::Error: Into<StdError> + Send + Sync,
+    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+    NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
+    I: InstantWrapper,
 {
-    /// Create a new GCSStore.  
-    /// The `endpoint` should be the gRPC endpoint (for example, `"http://localhost:50051"`).
-    pub async fn new(
-        endpoint: String,
-        bucket: String,
-        key_prefix: Option<String>,
-        now_fn: NowFn,
-    ) -> Result<Arc<Self>, Error> {
-        // In production you might need to set up TLS credentials here.
-        let channel = Channel::from_shared(endpoint)
-            .map_err(|e| make_err!(Code::Internal, "Invalid endpoint: {e:?}"))?
-            .connect()
-            .await
-            .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS endpoint: {e:?}"))?;
-
+    /// Creates a new GCSStore from a gRPC channel and specification.
+    pub async fn new(spec: &GcsSpec, channel: T, now_fn: NowFn) -> Result<Arc<Self>, Box<dyn StdError>> {
+        // Create the gRPC client using the provided channel.
         let client = StorageClient::new(channel);
-        // Construct a retrier (for brevity we assume a default configuration).
-        let retrier = Retrier::default();
 
+        // Build a jitter function for retrying requests.
+        let jitter_amt = spec.retry.jitter;
+        let jitter_fn = Arc::new(move |delay: Duration| {
+            if jitter_amt == 0. {
+                return delay;
+            }
+            let min = 1.0 - (jitter_amt / 2.0);
+            let max = 1.0 + (jitter_amt / 2.0);
+            delay.mul_f32(OsRng.gen_range(min..max))
+        });
+
+        Self::new_with_client_and_jitter(spec, client, jitter_fn, now_fn)
+    }
+
+    /// Creates a new GCSStore using an already-configured client and jitter function.
+    pub fn new_with_client_and_jitter(
+        spec: &GcsSpec,
+        client: StorageClient<T>,
+        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
+        now_fn: NowFn,
+    ) -> Result<Arc<Self>, Box<dyn StdError>> {
         Ok(Arc::new(Self {
-            client,
-            bucket,
-            key_prefix: key_prefix.unwrap_or_default(),
-            retrier,
-            consider_expired_after_s: 0, // set as needed via configuration
+            gcs_client: Arc::new(client),
             now_fn,
+            bucket: spec.bucket.clone(),
+            key_prefix: spec.key_prefix.clone().unwrap_or_default(),
+            retrier: Retrier::new(
+                // The retrier needs an async sleep function.
+                Arc::new(|duration| Box::pin(sleep(duration))),
+                jitter_fn,
+                spec.retry.clone(),
+            ),
+            consider_expired_after_s: spec.consider_expired_after_s,
+            max_retry_buffer_per_request: spec
+                .max_retry_buffer_per_request
+                .unwrap_or(DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST),
         }))
     }
 
-    /// Returns the object name by concatenating the key prefix and the key.
-    fn make_object_name(&self, key: &StoreKey<'_>) -> String {
+    /// Constructs the full object path by combining the key prefix and the provided key.
+    fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
         format!("{}{}", self.key_prefix, key.as_str())
     }
 
-    /// A helper function to perform a “head” operation (using GetObject) and return the object’s size.
-    async fn head_object(&mut self, object_name: &str) -> Result<Option<u64>, Error> {
-        let request = Request::new(GetObjectRequest {
-            bucket: self.bucket.clone(),
-            object: object_name.to_string(),
-            // Other fields default.
-            ..Default::default()
-        });
-        let response = self.client.get_object(request).await;
-        match response {
-            Ok(resp) => {
-                let obj: Object = resp.into_inner();
-                // If the object has a size field, return it.
-                Ok(obj.size.map(|s| s as u64))
-            }
-            Err(status) => {
-                if status.code() == tonic::Code::NotFound {
-                    Ok(None)
-                } else {
-                    Err(make_err!(Code::Unavailable, "GCS head_object error: {:?}", status))
-                }
-            }
-        }
+    /// An example method to upload an object.
+    ///
+    /// In a real implementation, you would call the appropriate method on
+    /// `self.gcs_client` using the gRPC API. Here, we wrap the call in our retry logic.
+    pub async fn upload_object(&self, key: &StoreKey<'_>, data: Vec<u8>) -> Result<(), Box<dyn StdError>> {
+        let object_path = self.make_gcs_path(key);
+        // Wrap the upload call in the retrier for robust error handling.
+        self.retrier.run(|| async {
+            // Here you would create and send the gRPC request.
+            // For example, if the gRPC method were called `upload_object`:
+            //
+            // let request = tonic::Request::new(UploadObjectRequest {
+            //     bucket: format!("projects/_/buckets/{}", self.bucket),
+            //     object: object_path.clone(),
+            //     data: data.clone(),
+            // });
+            //
+            // self.gcs_client.upload_object(request).await?;
+            //
+            // For this example, we’ll just return Ok(()); replace this with real logic.
+            Ok(())
+        }).await
     }
-}
-
-#[async_trait]
-impl<NowFn> StoreDriver for GCSStore<NowFn>
-where
-    NowFn: Fn() -> i64 + Send + Sync + 'static,
-{
-    /// Check whether each key exists by querying object metadata.
-    async fn has_with_results(
-        self: Pin<&Self>,
-        keys: &[StoreKey<'_>],
-        results: &mut [Option<u64>],
-    ) -> Result<(), Error> {
-        // For simplicity, we create a clone of the client for each call.
-        let this = self.get_ref();
-        let mut client = this.client.clone();
-
-        for (key, res) in keys.iter().zip(results.iter_mut()) {
-            let object_name = this.make_object_name(key);
-            let req = Request::new(GetObjectRequest {
-                bucket: this.bucket.clone(),
-                object: object_name,
-                ..Default::default()
-            });
-            match client.get_object(req).await {
-                Ok(response) => {
-                    let obj = response.into_inner();
-                    *res = obj.size.map(|s| s as u64);
-                }
-                Err(status) if status.code() == tonic::Code::NotFound => {
-                    *res = None;
-                }
-                Err(status) => {
-                    return Err(make_err!(Code::Unavailable, "GCS head_object error: {:?}", status));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Upload data to GCS by using the WriteObject streaming RPC.
-    /// This example sends the object metadata first, then streams chunks of data,
-    /// and finally sends a message with finish_write set.
-    async fn update(
-        self: Pin<&Self>,
-        digest: StoreKey<'_>,
-        mut reader: DropCloserReadHalf,
-        _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        let this = self.get_ref();
-        let object_name = this.make_object_name(&digest);
-        let bucket = this.bucket.clone();
-
-        // Create an async stream that yields WriteObjectRequest messages.
-        let request_stream = stream! {
-            // First message: send the object metadata.
-            yield WriteObjectRequest {
-                write_offset: 0,
-                object_spec: Some(Object {
-                    bucket: bucket.clone(),
-                    name: object_name.clone(),
-                    ..Default::default()
-                }),
-                // No data in the first message.
-                ..Default::default()
-            };
-
-            // Now stream data chunks (using a 1 MB buffer in this example).
-            let mut buf = vec![0u8; 1024 * 1024];
-            let mut offset: i64 = 0;
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break, // EOF reached.
-                    Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        yield WriteObjectRequest {
-                            write_offset: offset,
-                            data,
-                            ..Default::default()
-                        };
-                        offset += n as i64;
-                    }
-                    Err(e) => {
-                        // In a real implementation you might retry here.
-                        break;
-                    }
-                }
-            }
-            // Final message: indicate that writing is finished.
-            yield WriteObjectRequest {
-                finish_write: true,
-                ..Default::default()
-            };
-        };
-
-        // Call the WriteObject streaming RPC.
-        let request = Request::new(request_stream);
-        let mut response_stream = this.client.write_object(request).await
-            .map_err(|status| make_err!(Code::Unavailable, "GCS write_object error: {:?}", status))?
-            .into_inner();
-
-        // Consume the response stream (ignoring response details for now).
-        while let Some(_resp) = response_stream.message().await? {
-            // You could inspect the response here if desired.
-        }
-        Ok(())
-    }
-
-    /// Download a portion of an object using the ReadObject streaming RPC.
-    async fn get_part(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        writer: &mut DropCloserWriteHalf,
-        offset: u64,
-        length: Option<u64>,
-    ) -> Result<(), Error> {
-        let this = self.get_ref();
-        let object_name = this.make_object_name(&key);
-        let req = Request::new(ReadObjectRequest {
-            bucket: this.bucket.clone(),
-            object: object_name,
-            read_offset: offset as i64,
-            // If length is provided, set read_limit; note that a zero read_limit means “no limit”
-            read_limit: length.map(|l| l as i64).unwrap_or(0),
-            ..Default::default()
-        });
-        let mut stream = this.client.read_object(req).await
-            .map_err(|status| make_err!(Code::Unavailable, "GCS read_object error: {:?}", status))?
-            .into_inner();
-
-        while let Some(resp) = stream.message().await? {
-            if !resp.data.is_empty() {
-                writer.send(Bytes::from(resp.data))
-                    .await
-                    .map_err(|e| make_err!(Code::Aborted, "Failed to send chunk: {:?}", e))?;
-            }
-        }
-        writer.send_eof()
-            .map_err(|e| make_err!(Code::Aborted, "Failed to send EOF: {:?}", e))?;
-        Ok(())
-    }
-
-    fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
-        self
-    }
-
-    fn as_any<'a>(&'a self) -> &'a (dyn std::any::Any + Send + Sync + 'static) {
-        self
-    }
-
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync + 'static> {
-        self
-    }
-}
