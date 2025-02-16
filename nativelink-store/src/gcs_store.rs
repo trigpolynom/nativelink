@@ -1,150 +1,116 @@
-// Copyright 2024 The NativeLink Authors. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//    http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+use std::{any, time::Duration};
 
-use std::borrow::Cow;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use anyhow::{Context, Result};
+use google_cloud_auth::{project::Config, token::DefaultTokenSourceProvider};
+use google_cloud_storage::google::storage::v2::{storage_client::StorageClient, Bucket, GetBucketRequest};
+use google_cloud_token::TokenSourceProvider as _;
+use tonic::{service::{interceptor::InterceptedService, Interceptor}, transport::{Channel, ClientTlsConfig}, Request, Status};
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures::stream::unfold;
-use futures::TryStreamExt;
-use google_cloud_storage::google::storage::v2::storage_client::StorageClient;
-use nativelink_config::stores::GcsSpec;
-use nativelink_error::{make_err, Code, Error, ResultExt};
-use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{
-    make_buf_channel_pair, DropCloserReadHalf, DropCloserWriteHalf,
-};
-use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
-use nativelink_util::instant_wrapper::InstantWrapper;
-use nativelink_util::retry::{Retrier, RetryResult};
-use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
-use rand::rngs::OsRng;
-use rand::Rng;
-use tokio::time::sleep;
-use tracing::{error, info};
 
-use crate::cas_utils::is_zero_digest;
-
-// A placeholder for your retry configuration.
 #[derive(Clone)]
-pub struct RetrySpec {
-    pub jitter: f32,
-    // ... other retry parameters
+struct AuthInterceptor {
+    token: String,
 }
 
-// We use the generated GCS client from the tonic build:
-use storage_client::StorageClient;
+impl Interceptor for AuthInterceptor {
+    fn call(&mut self, mut req: Request<()>) -> std::result::Result<Request<()>, Status> {
+        let bearer = &self.token;
+        req.metadata_mut()
+            .insert("authorization", bearer.parse().unwrap());
+        Ok(req)
+    }
+}
 
-// Our GCSStore struct, similar to the S3Store:
-#[derive(MetricsComponent)]
-pub struct GCSStore<NowFn, T> {
-    // The gRPC client for Google Cloud Storage.
-    gcs_client: Arc<StorageClient<T>>,
-    now_fn: NowFn,
-    #[metric(help = "The bucket name for the GCS store")]
+#[derive(Debug, Clone)]
+pub struct GcsStore {
+    storage_client: StorageClient<InterceptedService<Channel, AuthInterceptor>>,
     bucket: String,
-    #[metric(help = "The key prefix for the GCS store")]
-    key_prefix: String,
-    retrier: Retrier,
-    #[metric(help = "The number of seconds to consider an object expired")]
-    consider_expired_after_s: i64,
-    #[metric(help = "The number of bytes to buffer for retrying requests")]
-    max_retry_buffer_per_request: usize,
 }
 
-impl<NowFn, T, I> GCSStore<NowFn, T>
-where
-    // T is the underlying transport (typically a tonic Channel or similar).
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
-    T::Error: Into<StdError> + Send + Sync,
-    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
-    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
-    NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
-    I: InstantWrapper,
-{
-    /// Creates a new GCSStore from a gRPC channel and specification.
-    pub async fn new(spec: &GcsSpec, channel: T, now_fn: NowFn) -> Result<Arc<Self>, Box<dyn StdError>> {
-        // Create the gRPC client using the provided channel.
-        let client = StorageClient::new(channel);
-
-        // Build a jitter function for retrying requests.
-        let jitter_amt = spec.retry.jitter;
-        let jitter_fn = Arc::new(move |delay: Duration| {
-            if jitter_amt == 0. {
-                return delay;
-            }
-            let min = 1.0 - (jitter_amt / 2.0);
-            let max = 1.0 + (jitter_amt / 2.0);
-            delay.mul_f32(OsRng.gen_range(min..max))
-        });
-
-        Self::new_with_client_and_jitter(spec, client, jitter_fn, now_fn)
-    }
-
-    /// Creates a new GCSStore using an already-configured client and jitter function.
-    pub fn new_with_client_and_jitter(
-        spec: &GcsSpec,
-        client: StorageClient<T>,
-        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
-        now_fn: NowFn,
-    ) -> Result<Arc<Self>, Box<dyn StdError>> {
-        Ok(Arc::new(Self {
-            gcs_client: Arc::new(client),
-            now_fn,
-            bucket: spec.bucket.clone(),
-            key_prefix: spec.key_prefix.clone().unwrap_or_default(),
-            retrier: Retrier::new(
-                // The retrier needs an async sleep function.
-                Arc::new(|duration| Box::pin(sleep(duration))),
-                jitter_fn,
-                spec.retry.clone(),
-            ),
-            consider_expired_after_s: spec.consider_expired_after_s,
-            max_retry_buffer_per_request: spec
-                .max_retry_buffer_per_request
-                .unwrap_or(DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST),
-        }))
-    }
-
-    /// Constructs the full object path by combining the key prefix and the provided key.
-    fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
-        format!("{}{}", self.key_prefix, key.as_str())
-    }
-
-    /// An example method to upload an object.
+impl GcsStore {
+    /// Create a new GcsStore wrapper.
     ///
-    /// In a real implementation, you would call the appropriate method on
-    /// `self.gcs_client` using the gRPC API. Here, we wrap the call in our retry logic.
-    pub async fn upload_object(&self, key: &StoreKey<'_>, data: Vec<u8>) -> Result<(), Box<dyn StdError>> {
-        let object_path = self.make_gcs_path(key);
-        // Wrap the upload call in the retrier for robust error handling.
-        self.retrier.run(|| async {
-            // Here you would create and send the gRPC request.
-            // For example, if the gRPC method were called `upload_object`:
-            //
-            // let request = tonic::Request::new(UploadObjectRequest {
-            //     bucket: format!("projects/_/buckets/{}", self.bucket),
-            //     object: object_path.clone(),
-            //     data: data.clone(),
-            // });
-            //
-            // self.gcs_client.upload_object(request).await?;
-            //
-            // For this example, we’ll just return Ok(()); replace this with real logic.
-            Ok(())
-        }).await
+    /// This performs the authentication, sets up the gRPC channel with an interceptor,
+    /// and remembers the target bucket.
+    pub async fn new(bucket: impl Into<String>) -> Result<Self> {
+        let bucket = bucket.into();
+
+        // --- Authenticate with Google Cloud ---
+        let audience = "https://storage.googleapis.com/";
+        let scopes = ["https://www.googleapis.com/auth/storage"];
+        let config = Config::default()
+            .with_audience(audience)
+            .with_scopes(&scopes)
+            .with_use_id_token(false);
+        
+        let tsp = DefaultTokenSourceProvider::new(config)
+            .await
+            .context("Failed to create token source provider")?;
+        let ts = tsp.token_source();
+        let token = ts
+            .token()
+            .await
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+            .context("Failed to obtain token")?;
+
+        // Create the interceptor using the retrieved token.
+        let auth_interceptor = AuthInterceptor {
+            token: token,
+        };
+        let endpoint = "https://storage.googleapis.com".to_string();
+        // --- Build the gRPC channel ---
+        // Adjust the endpoint if necessary. Here we assume the default storage endpoint.
+        let channel = Channel::from_shared(endpoint)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .connect_timeout(Duration::from_secs(5))
+            .tcp_nodelay(true)
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .connect()
+            .await
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+        
+        let storage_client = StorageClient::with_interceptor(channel, auth_interceptor);
+
+        Ok(Self {
+            storage_client,
+            bucket,
+        })
     }
+
+    /// Retrieve bucket metadata from GCS.
+    pub async fn get_bucket(&mut self) -> Result<Bucket, tonic::Status> {
+        let req = GetBucketRequest {
+            name: self.bucket.clone(),
+            if_metageneration_match: None,
+            if_metageneration_not_match: None,
+            read_mask: None
+        };
+
+        let mut req = Request::new(req);
+        req.metadata_mut().insert(
+            "x-goog-request-params",
+            format!("name={}", self.bucket).parse().expect("valid header"),
+        );
+        
+        let response = self.storage_client.get_bucket(req).await?;
+        Ok(response.into_inner())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let bucket_name = "testnativelink";
+    let mut gcs_store = GcsStore::new(bucket_name)
+        .await
+        .context("Failed to create GcsStore")?;
+
+    match gcs_store.get_bucket().await {
+        Ok(bucket) => println!("Retrieved bucket: {:?}", bucket),
+        Err(status) => eprintln!("Error retrieving bucket: {:?}", status),
+    }
+
+    Ok(())
+}

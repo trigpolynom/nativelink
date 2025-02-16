@@ -44,6 +44,8 @@ fred = { version = "10.0.3", default-features = false, features = [
   "subscriber-client",
 ] }
 google_cloud_storage = { package = "googleapis-tonic-google-storage-v2", version = "0.17.0"}
+google-cloud-auth = { package="gcloud-auth", version="1.0.0" }
+google-cloud-token = { package="gcloud-token", version="1.0.0" }
 jsonwebtoken = "9.3.0"
 patricia_tree = { version = "0.8.0", default-features = false }
 futures = { version = "0.3.31", default-features = false }
