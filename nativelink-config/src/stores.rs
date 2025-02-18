@@ -812,19 +812,34 @@ pub struct S3Spec {
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct GcsSpec {
-    /// Project ID for the GCS service
-    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
-    pub service_email: String,
-
-    /// Bucket name to use as the backend
+    /// GCS bucket name.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub bucket: String,
 
-    /// If you wish to prefix the location in GCS. If None, no prefix will be used.
-    #[serde(default)]
-    pub key_prefix: Option<String>,
+    /// GCS endpoint. Default: "https://storage.googleapis.com"
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub endpoint: String,
 
-    /// Retry configuration to use when a network request fails.
+    /// Audience for token generation. Default: "https://storage.googleapis.com/"
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub audience: String,
+
+    /// Scopes for token generation.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub use_id_token: bool,
+
+    /// Connection timeout in seconds.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+
+    /// HTTP2 keep-alive interval in seconds.
+    #[serde(default)]
+    pub http2_keep_alive_interval_secs: Option<u64>,
+
+    /// Retry configuration.
     #[serde(default)]
     pub retry: Retry,
 
@@ -850,35 +865,30 @@ pub struct GcsSpec {
     /// Default: 5MB.
     pub max_retry_buffer_per_request: Option<usize>,
 
-    /// Size of chunks for resumeable uploads (in bytes).
-    /// Must be a multiple of 256 KB.
-    ///
-    /// Default: 8MB.
-    pub resumable_chunk_size: Option<usize>,
+    pub tcp_nodely: bool,
 
-    /// Maximum number of concurrent uploads for resumable operations
+    pub http2_adaptive_window: bool,
+
+    /// Maximum number of concurrent `UploadPart` requests per `MultipartUpload`.
     ///
     /// Default: 10.
-    pub max_concurrent_uploads: Option<usize>,
+    pub multipart_max_concurrent_uploads: Option<usize>,
 
-    /// Optional endpoint override for testing
-    /// Example: "localhost:8080" for local development
-    ///
-    /// Default: None (uses production GCS endpoint)
+    /// Optional compression encoding for sending requests, as a string (e.g., "gzip").
     #[serde(default)]
-    pub endpoint: Option<String>,
+    pub send_compressed: Option<String>,
 
-    /// Allow unencrypted HTTP connections. Only use this for local testing.
-    ///
-    /// Default: false
+    /// Optional compression encoding for accepting responses, as a string (e.g., "gzip").
     #[serde(default)]
-    pub insecure_allow_http: bool,
+    pub accept_compressed: Option<String>,
 
-    /// Disable http/2 connections and only use http/1.1.
-    ///
-    /// Default: false
+    /// Optional maximum size (in bytes) for a decoded message.
     #[serde(default)]
-    pub disable_http2: bool,
+    pub max_decoding_message_size: Option<usize>,
+
+    /// Optional maximum size (in bytes) for an encoded message.
+    #[serde(default)]
+    pub max_encoding_message_size: Option<usize>,
 }
 
 #[allow(non_camel_case_types)]
