@@ -1,13 +1,13 @@
-use std::{any, error::Error, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
 use bytes::Bytes;
 use google_cloud_auth::{project::Config, token::DefaultTokenSourceProvider};
 use google_cloud_storage::google::storage::v2::{storage_client::StorageClient, Bucket, GetBucketRequest};
 use google_cloud_token::TokenSourceProvider as _;
-pub type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+use tonic::codegen::StdError;
 use nativelink_config::stores::GcsSpec;
 use nativelink_metric::MetricsComponent;
+use nativelink_error::{make_err, Code, Error};
 use nativelink_util::{instant_wrapper::InstantWrapper, retry::Retrier};
 use rand::{rngs::OsRng, Rng};
 use tokio::time::sleep;
@@ -61,8 +61,12 @@ impl Default for ChannelConfig {
 
 impl ChannelConfig {
     /// Builds a gRPC channel using this configuration.
-    pub async fn build_channel(&self) -> Result<Channel, anyhow::Error> {
-        let mut builder = Channel::from_shared(self.endpoint.clone())?
+    pub async fn build_channel(&self) -> Result<Channel, Error> {
+        let endpoint = Channel::from_shared(self.endpoint.clone())
+            .map_err(|e| make_err!(Code::Unavailable, "Failed to create channel: {e}"))?;
+        
+        // Now we have an Endpoint, so we can configure it.
+        let mut builder = endpoint
             .connect_timeout(self.connect_timeout)
             .tcp_nodelay(self.tcp_nodelay)
             .http2_adaptive_window(self.http2_adaptive_window)
@@ -120,74 +124,74 @@ fn parse_compression_encoding(encoding: &str) -> Option<CompressionEncoding> {
     }
 }
 
-/// Extension trait to chain optional configuration for the storage client.
-pub trait StorageClientExt: Sized {
-    fn maybe_send_compressed(self, encoding: Option<&str>) -> Self;
-    fn maybe_accept_compressed(self, encoding: Option<&str>) -> Self;
-    fn maybe_max_decoding_message_size(self, size: Option<usize>) -> Self;
-    fn maybe_max_encoding_message_size(self, size: Option<usize>) -> Self;
+// /// Extension trait to chain optional configuration for the storage client.
+// pub trait StorageClientExt: Sized {
+//     fn maybe_send_compressed(self, encoding: Option<&str>) -> Self;
+//     fn maybe_accept_compressed(self, encoding: Option<&str>) -> Self;
+//     fn maybe_max_decoding_message_size(self, size: Option<usize>) -> Self;
+//     fn maybe_max_encoding_message_size(self, size: Option<usize>) -> Self;
 
-    // These methods are provided by the underlying client.
-    fn send_compressed(self, encoding: CompressionEncoding) -> Self;
-    fn accept_compressed(self, encoding: CompressionEncoding) -> Self;
-    fn max_decoding_message_size(self, limit: usize) -> Self;
-    fn max_encoding_message_size(self, limit: usize) -> Self;
-}
+//     // These methods are provided by the underlying client.
+//     fn send_compressed(self, encoding: CompressionEncoding) -> Self;
+//     fn accept_compressed(self, encoding: CompressionEncoding) -> Self;
+//     fn max_decoding_message_size(self, limit: usize) -> Self;
+//     fn max_encoding_message_size(self, limit: usize) -> Self;
+// }
 
 
-impl<T> StorageClientExt for StorageClient<T>
-where
-    T: tonic::client::GrpcService<tonic::body::BoxBody>,
-    T::Error: Into<StdError>,
-    T::ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
-    <T::ResponseBody as http_body::Body>::Error: Into<StdError> + Send,
-{
-    fn maybe_send_compressed(self, encoding: Option<&str>) -> Self {
-        if let Some(enc_str) = encoding {
-            if let Some(enc) = parse_compression_encoding(enc_str) {
-                return self.send_compressed(enc);
-            }
-        }
-        self
-    }
+// impl<T> StorageClientExt for StorageClient<T>
+// where
+//     T: tonic::client::GrpcService<tonic::body::BoxBody>,
+//     T::Error: Into<StdError>,
+//     T::ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
+//     <T::ResponseBody as http_body::Body>::Error: Into<StdError> + Send,
+// {
+//     fn maybe_send_compressed(self, encoding: Option<&str>) -> Self {
+//         if let Some(enc_str) = encoding {
+//             if let Some(enc) = parse_compression_encoding(enc_str) {
+//                 return self.send_compressed(enc);
+//             }
+//         }
+//         self
+//     }
 
-    fn maybe_accept_compressed(self, encoding: Option<&str>) -> Self {
-        if let Some(enc_str) = encoding {
-            if let Some(enc) = parse_compression_encoding(enc_str) {
-                return self.accept_compressed(enc);
-            }
-        }
-        self
-    }
+//     fn maybe_accept_compressed(self, encoding: Option<&str>) -> Self {
+//         if let Some(enc_str) = encoding {
+//             if let Some(enc) = parse_compression_encoding(enc_str) {
+//                 return self.accept_compressed(enc);
+//             }
+//         }
+//         self
+//     }
 
-    fn maybe_max_decoding_message_size(self, size: Option<usize>) -> Self {
-        if let Some(limit) = size {
-            return self.max_decoding_message_size(limit);
-        }
-        self
-    }
+//     fn maybe_max_decoding_message_size(self, size: Option<usize>) -> Self {
+//         if let Some(limit) = size {
+//             return self.max_decoding_message_size(limit);
+//         }
+//         self
+//     }
 
-    fn maybe_max_encoding_message_size(self, size: Option<usize>) -> Self {
-        if let Some(limit) = size {
-            return self.max_encoding_message_size(limit);
-        }
-        self
-    }
+//     fn maybe_max_encoding_message_size(self, size: Option<usize>) -> Self {
+//         if let Some(limit) = size {
+//             return self.max_encoding_message_size(limit);
+//         }
+//         self
+//     }
 
-    // The following simply call the inherent methods.
-    fn send_compressed(self, encoding: CompressionEncoding) -> Self {
-        StorageClient::send_compressed(self, encoding)
-    }
-    fn accept_compressed(self, encoding: CompressionEncoding) -> Self {
-        StorageClient::accept_compressed(self, encoding)
-    }
-    fn max_decoding_message_size(self, limit: usize) -> Self {
-        StorageClient::max_decoding_message_size(self, limit)
-    }
-    fn max_encoding_message_size(self, limit: usize) -> Self {
-        StorageClient::max_encoding_message_size(self, limit)
-    }
-}
+//     // The following simply call the inherent methods.
+//     fn send_compressed(self, encoding: CompressionEncoding) -> Self {
+//         StorageClient::send_compressed(self, encoding)
+//     }
+//     fn accept_compressed(self, encoding: CompressionEncoding) -> Self {
+//         StorageClient::accept_compressed(self, encoding)
+//     }
+//     fn max_decoding_message_size(self, limit: usize) -> Self {
+//         StorageClient::max_decoding_message_size(self, limit)
+//     }
+//     fn max_encoding_message_size(self, limit: usize) -> Self {
+//         StorageClient::max_encoding_message_size(self, limit)
+//     }
+// }
 
 #[derive(Clone)]
 struct AuthInterceptor {
@@ -222,24 +226,23 @@ where
     ///
     /// This performs the authentication, sets up the gRPC channel with an interceptor,
     /// and remembers the target bucket.
-    pub async fn new(spec: &GcsSpec, now_fn: NowFn) -> Result<Self> {
+    pub async fn new(spec: &GcsSpec, now_fn: NowFn) -> Result<Arc<Self>, Error>  {
         let jitter_amt = spec.retry.jitter;
-        let jitter_fn = Arc::new(move | delay: Duration|) {
+        let jitter_fn = Arc::new(move |delay: Duration| {
             if jitter_amt == 0. {
                 return delay;
             }
             let min = 1. - (jitter_amt / 2.);
-            let max = 1. + (jitter_amt / 2);
-            delay.mul_f32(OsRng.gen_range(min..max)
-        )};
-
+            let max = 1. + (jitter_amt / 2.);
+            delay.mul_f32(OsRng.gen_range(min..max))
+        });
         let channel_config = ChannelConfig::from(spec);
         
         let use_id_token = spec.use_id_token.unwrap_or(false).clone();
 
         let config = Config::default()
-            .with_audience(audience)
-            .with_scopes(&scopes)
+            .with_audience(&spec.audience)
+            .with_scopes(&spec.scopes)
             .with_use_id_token(use_id_token);
         
         let tsp = DefaultTokenSourceProvider::new(config)
@@ -290,37 +293,37 @@ where
         }))
     }
 
-    /// Retrieve bucket metadata from GCS.
-    pub async fn get_bucket(&mut self) -> Result<Bucket, tonic::Status> {
-        let req = GetBucketRequest {
-            name: self.bucket.clone(),
-            if_metageneration_match: None,
-            if_metageneration_not_match: None,
-            read_mask: None
-        };
+    // /// Retrieve bucket metadata from GCS.
+    // pub async fn get_bucket(&mut self) -> Result<Bucket, tonic::Status> {
+    //     let req = GetBucketRequest {
+    //         name: self.bucket.clone(),
+    //         if_metageneration_match: None,
+    //         if_metageneration_not_match: None,
+    //         read_mask: None
+    //     };
 
-        let mut req = Request::new(req);
-        req.metadata_mut().insert(
-            "x-goog-request-params",
-            format!("name={}", self.bucket).parse().expect("valid header"),
-        );
+    //     let mut req = Request::new(req);
+    //     req.metadata_mut().insert(
+    //         "x-goog-request-params",
+    //         format!("name={}", self.bucket).parse().expect("valid header"),
+    //     );
         
-        let response = self.storage_client.get_bucket(req).await?;
-        Ok(response.into_inner())
-    }
+    //     let response = self.storage_client.get_bucket(req).await?;
+    //     Ok(response.into_inner())
+    // }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let bucket_name = "testnativelink";
-    let mut gcs_store = GcsStore::new(bucket_name)
-        .await
-        .context("Failed to create GcsStore")?;
+// #[tokio::main]
+// async fn main() -> Result<()> {
+//     let bucket_name = "testnativelink";
+//     let mut gcs_store = GcsStore::new(bucket_name)
+//         .await
+//         .context("Failed to create GcsStore")?;
 
-    match gcs_store.get_bucket().await {
-        Ok(bucket) => println!("Retrieved bucket: {:?}", bucket),
-        Err(status) => eprintln!("Error retrieving bucket: {:?}", status),
-    }
+//     match gcs_store.get_bucket().await {
+//         Ok(bucket) => println!("Retrieved bucket: {:?}", bucket),
+//         Err(status) => eprintln!("Error retrieving bucket: {:?}", status),
+//     }
 
-    Ok(())
-}
+//     Ok(())
+// }
