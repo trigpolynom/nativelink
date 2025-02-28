@@ -863,7 +863,7 @@ pub struct GcsSpec {
     /// upload will be aborted and the client will likely receive an error.
     ///
     /// Default: 5MB.
-    pub max_retry_buffer_per_request: Option<usize>,
+    pub max_retry_buffer_per_request: Option<u64>,
 
     pub tcp_nodely: bool,
 
@@ -872,7 +872,7 @@ pub struct GcsSpec {
     /// Maximum number of concurrent `UploadPart` requests per `MultipartUpload`.
     ///
     /// Default: 10.
-    pub multipart_max_concurrent_uploads: Option<usize>,
+    pub multipart_max_concurrent_uploads: Option<u64>,
 
     /// Optional compression encoding for sending requests, as a string (e.g., "gzip").
     #[serde(default)]
@@ -884,11 +884,11 @@ pub struct GcsSpec {
 
     /// Optional maximum size (in bytes) for a decoded message.
     #[serde(default)]
-    pub max_decoding_message_size: Option<usize>,
+    pub max_decoding_message_size: Option<u64>,
 
     /// Optional maximum size (in bytes) for an encoded message.
     #[serde(default)]
-    pub max_encoding_message_size: Option<usize>,
+    pub max_encoding_message_size: Option<u64>,
 }
 
 #[allow(non_camel_case_types)]

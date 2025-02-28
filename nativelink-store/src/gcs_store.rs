@@ -4,28 +4,28 @@ use bytes::Bytes;
 use google_cloud_auth::{project::Config, token::DefaultTokenSourceProvider};
 use google_cloud_storage::google::storage::v2::{storage_client::StorageClient, Bucket, GetBucketRequest};
 use google_cloud_token::TokenSourceProvider as _;
-use tonic::codegen::StdError;
+use tonic::{codegen::StdError, Response};
 use nativelink_config::stores::GcsSpec;
 use nativelink_metric::MetricsComponent;
-use nativelink_error::{make_err, Code, Error};
+use nativelink_error::{make_err, make_input_err, Code, Error};
 use nativelink_util::{instant_wrapper::InstantWrapper, retry::Retrier};
 use rand::{rngs::OsRng, Rng};
-use tokio::time::sleep;
+use tokio::{sync::Mutex, time::sleep};
 use tonic::{service::{interceptor::InterceptedService, Interceptor}, transport::{Channel, ClientTlsConfig}, Request, Status};
 use tonic::codec::CompressionEncoding;
 
 // Default max buffer size for retrying upload requests.
 // Note: If you change this, adjust the docs in the config.
-const DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST: usize = 5 * 1024 * 1024; // 5MB.
+const DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST: u64 = 5 * 1024 * 1024; // 5MB.
 
 // Default limit for concurrent part uploads per multipart upload.
 // Note: If you change this, adjust the docs in the config.
-const DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS: usize = 10;
+const DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS: u64 = 10;
 
 const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com/";
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/storage";
-const DEFAULT_CONNECT_TIMEOUT: usize = 5;
-const DEFAULT_KEEPALIVE_INTERVAL: usize = 30;
+const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
+const DEFAULT_KEEPALIVE_INTERVAL: u64 = 30;
 const DEFAULT_TCP_NODELAY: bool = true;
 const DEFAULT_HTTP2_ADAPTIVE_WINDOW: bool = true;
 
@@ -98,100 +98,24 @@ impl From<&GcsSpec> for ChannelConfig {
     }
 }
 
-fn parse_compression_encoding(encoding: &str) -> Option<CompressionEncoding> {
-    match encoding.to_lowercase().as_str() {
-        "gzip" => {
-            #[cfg(feature = "gzip")]
-            {
-                Some(CompressionEncoding::Gzip)
-            }
-            #[cfg(not(feature = "gzip"))]
-            {
-                None
-            }
-        },
-        "zstd" => {
-            #[cfg(feature = "zstd")]
-            {
-                Some(CompressionEncoding::Zstd)
-            }
-            #[cfg(not(feature = "zstd"))]
-            {
-                None
-            }
-        },
-        _ => None,
-    }
+pub struct GcsClient {
+    inner: Arc<Mutex<StorageClient<InterceptedService<Channel, AuthInterceptor>>>>,
 }
 
-// /// Extension trait to chain optional configuration for the storage client.
-// pub trait StorageClientExt: Sized {
-//     fn maybe_send_compressed(self, encoding: Option<&str>) -> Self;
-//     fn maybe_accept_compressed(self, encoding: Option<&str>) -> Self;
-//     fn maybe_max_decoding_message_size(self, size: Option<usize>) -> Self;
-//     fn maybe_max_encoding_message_size(self, size: Option<usize>) -> Self;
+impl GcsClient {
+    /// Create a new GcsClient from a StorageClient.
+    pub fn new(client: StorageClient<InterceptedService<Channel, AuthInterceptor>>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(client)),
+        }
+    }
 
-//     // These methods are provided by the underlying client.
-//     fn send_compressed(self, encoding: CompressionEncoding) -> Self;
-//     fn accept_compressed(self, encoding: CompressionEncoding) -> Self;
-//     fn max_decoding_message_size(self, limit: usize) -> Self;
-//     fn max_encoding_message_size(self, limit: usize) -> Self;
-// }
-
-
-// impl<T> StorageClientExt for StorageClient<T>
-// where
-//     T: tonic::client::GrpcService<tonic::body::BoxBody>,
-//     T::Error: Into<StdError>,
-//     T::ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
-//     <T::ResponseBody as http_body::Body>::Error: Into<StdError> + Send,
-// {
-//     fn maybe_send_compressed(self, encoding: Option<&str>) -> Self {
-//         if let Some(enc_str) = encoding {
-//             if let Some(enc) = parse_compression_encoding(enc_str) {
-//                 return self.send_compressed(enc);
-//             }
-//         }
-//         self
-//     }
-
-//     fn maybe_accept_compressed(self, encoding: Option<&str>) -> Self {
-//         if let Some(enc_str) = encoding {
-//             if let Some(enc) = parse_compression_encoding(enc_str) {
-//                 return self.accept_compressed(enc);
-//             }
-//         }
-//         self
-//     }
-
-//     fn maybe_max_decoding_message_size(self, size: Option<usize>) -> Self {
-//         if let Some(limit) = size {
-//             return self.max_decoding_message_size(limit);
-//         }
-//         self
-//     }
-
-//     fn maybe_max_encoding_message_size(self, size: Option<usize>) -> Self {
-//         if let Some(limit) = size {
-//             return self.max_encoding_message_size(limit);
-//         }
-//         self
-//     }
-
-//     // The following simply call the inherent methods.
-//     fn send_compressed(self, encoding: CompressionEncoding) -> Self {
-//         StorageClient::send_compressed(self, encoding)
-//     }
-//     fn accept_compressed(self, encoding: CompressionEncoding) -> Self {
-//         StorageClient::accept_compressed(self, encoding)
-//     }
-//     fn max_decoding_message_size(self, limit: usize) -> Self {
-//         StorageClient::max_decoding_message_size(self, limit)
-//     }
-//     fn max_encoding_message_size(self, limit: usize) -> Self {
-//         StorageClient::max_encoding_message_size(self, limit)
-//     }
-// }
+    /// Example method: get a bucket by forwarding the call to the inner client.
+    pub async fn get_bucket(&self, req: Request<GetBucketRequest>) -> Result<Response<Bucket>, Status> {
+        let mut client = self.inner.lock().await;
+        client.get_bucket(req).await
+    }
+}
 
 #[derive(Clone)]
 struct AuthInterceptor {
@@ -209,13 +133,13 @@ impl Interceptor for AuthInterceptor {
 
 #[derive(MetricsComponent)]
 pub struct GcsStore<NowFn> {
-    storage_client: Arc<StorageClient<InterceptedService<Channel, AuthInterceptor>>>,
+    storage_client: GcsClient,
     now_fn: NowFn,
     bucket: String,
     retrier: Retrier,
     consider_expired_after_s: i64,
-    max_retry_buffer_per_request: usize,
-    multipart_max_concurrent_uploads: usize,
+    max_retry_buffer_per_request: u64,
+    multipart_max_concurrent_uploads: u64,
 }
 
 impl<I, NowFn> GcsStore<NowFn>
@@ -238,19 +162,32 @@ where
         });
         let channel_config = ChannelConfig::from(spec);
         
-        let use_id_token = spec.use_id_token.unwrap_or(false).clone();
+        let use_id_token = spec.use_id_token.clone();
 
-        let config = Config::default()
+        // Convert Vec<String> -> Vec<&str> (only if spec.scopes is Some)
+        let scopes_vec: Option<Vec<&str>> = spec.scopes
+            .as_ref()
+            .map(|vec| vec.iter().map(String::as_str).collect());
+
+            // Convert Option<Vec<&str>> to Option<&[&str]>
+            let scopes_slice: Option<&[&str]> = scopes_vec.as_deref();
+
+            let config = Config::default()
             .with_audience(&spec.audience)
-            .with_scopes(&spec.scopes)
+            .with_scopes(scopes_slice.unwrap_or(&[])) // ✅ Reference is now valid
             .with_use_id_token(use_id_token);
-        
+
         let tsp = DefaultTokenSourceProvider::new(config)
-            .await?;
+            .await
+            .map_err(|e| make_input_err!("Failed to create DefaultTokenSourceProvider: {e:?}"))?;
+            
+            
         let ts = tsp.token_source();
         let token = ts
             .token()
-            .await?;
+            .await
+            .map_err(|e| make_input_err!("Failed to create token: {e:?}"))?;
+            
 
         let auth_interceptor = AuthInterceptor {
             token: token,
@@ -259,8 +196,6 @@ where
         let http2_keep_alive_interval =
             Duration::from_secs(spec.http2_keep_alive_interval_secs.unwrap_or(DEFAULT_KEEPALIVE_INTERVAL));
 
-        // --- Build the gRPC channel ---
-        // Adjust the endpoint if necessary. Here we assume the default storage endpoint.
         let channel = channel_config.build_channel().await?;
         
         let storage_client = StorageClient::with_interceptor(channel, auth_interceptor);
@@ -275,7 +210,7 @@ where
         now_fn: NowFn,
     ) -> Result<Arc<Self>, Error>  {
         Ok(Arc::new(Self {
-            storage_client: Arc::new(storage_client),
+            storage_client: GcsClient::new(storage_client),
             bucket: spec.bucket.clone(),
             retrier: Retrier::new(
                 Arc::new(|duration| Box::pin(sleep(duration))),
@@ -293,37 +228,22 @@ where
         }))
     }
 
-    // /// Retrieve bucket metadata from GCS.
-    // pub async fn get_bucket(&mut self) -> Result<Bucket, tonic::Status> {
-    //     let req = GetBucketRequest {
-    //         name: self.bucket.clone(),
-    //         if_metageneration_match: None,
-    //         if_metageneration_not_match: None,
-    //         read_mask: None
-    //     };
+    /// Retrieve bucket metadata from GCS.
+    pub async fn get_bucket(&mut self) -> Result<Bucket, tonic::Status> {
+        let req = GetBucketRequest {
+            name: self.bucket.clone(),
+            if_metageneration_match: None,
+            if_metageneration_not_match: None,
+            read_mask: None
+        };
 
-    //     let mut req = Request::new(req);
-    //     req.metadata_mut().insert(
-    //         "x-goog-request-params",
-    //         format!("name={}", self.bucket).parse().expect("valid header"),
-    //     );
+        let mut req = Request::new(req);
+        req.metadata_mut().insert(
+            "x-goog-request-params",
+            format!("name={}", self.bucket).parse().expect("valid header"),
+        );
         
-    //     let response = self.storage_client.get_bucket(req).await?;
-    //     Ok(response.into_inner())
-    // }
+        let response = self.storage_client.get_bucket(req).await?;
+        Ok(response.into_inner())
+    }
 }
-
-// #[tokio::main]
-// async fn main() -> Result<()> {
-//     let bucket_name = "testnativelink";
-//     let mut gcs_store = GcsStore::new(bucket_name)
-//         .await
-//         .context("Failed to create GcsStore")?;
-
-//     match gcs_store.get_bucket().await {
-//         Ok(bucket) => println!("Retrieved bucket: {:?}", bucket),
-//         Err(status) => eprintln!("Error retrieving bucket: {:?}", status),
-//     }
-
-//     Ok(())
-// }
