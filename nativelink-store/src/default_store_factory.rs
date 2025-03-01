@@ -29,7 +29,7 @@ use crate::dedup_store::DedupStore;
 use crate::existence_cache_store::ExistenceCacheStore;
 use crate::fast_slow_store::FastSlowStore;
 use crate::filesystem_store::FilesystemStore;
-use crate::gcs_store::GcsStore;
+use crate::gcs_store::{GcsStore};
 use crate::grpc_store::GrpcStore;
 use crate::memory_store::MemoryStore;
 use crate::noop_store::NoopStore;
