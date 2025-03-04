@@ -831,6 +831,10 @@ pub struct GcsSpec {
     #[serde(default)]
     pub use_id_token: bool,
 
+    /// If you wish to prefix the location. If None, no prefix will be used.
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+
     /// Connection timeout in seconds.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,

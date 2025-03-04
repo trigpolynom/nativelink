@@ -1,20 +1,21 @@
 use std::{borrow::Cow, pin::Pin, sync::Arc, time::{Duration, SystemTime}};
 
 use bytes::Bytes;
-use futures::{stream::FuturesUnordered, TryStreamExt};
+use futures::{stream::{unfold, FuturesUnordered}, TryStreamExt};
 use google_cloud_auth::{project::Config, token::DefaultTokenSourceProvider};
-use google_cloud_storage::google::storage::v2::{storage_client::StorageClient, Bucket, GetBucketRequest, UpdateBucketRequest};
+use google_cloud_storage::google::storage::v2::{storage_client::StorageClient, Bucket, GetBucketRequest, GetObjectRequest, Object, UpdateBucketRequest};
 use google_cloud_token::TokenSourceProvider as _;
-use tonic::{async_trait, codegen::StdError, Response};
+use tonic::{async_trait, codegen::StdError, Response, Streaming};
 use nativelink_config::stores::{ErrorCode, GcsSpec, Retry};
 use nativelink_metric::{MetricsComponent};
 use nativelink_error::{make_err, make_input_err, Code, Error};
-use nativelink_util::{buf_channel::{DropCloserReadHalf, DropCloserWriteHalf}, health_utils::{HealthStatus, HealthStatusIndicator}, instant_wrapper::InstantWrapper, retry::Retrier, store_trait::{StoreDriver, StoreKey, UploadSizeInfo}};
+use nativelink_util::{buf_channel::{DropCloserReadHalf, DropCloserWriteHalf}, health_utils::{HealthStatus, HealthStatusIndicator}, instant_wrapper::InstantWrapper, retry::{Retrier, RetryResult}, store_trait::{StoreDriver, StoreKey, UploadSizeInfo}};
 use rand::{rngs::OsRng, Rng};
 use tokio::{sync::Mutex, time::sleep};
 use tonic::{service::{interceptor::InterceptedService, Interceptor}, transport::{Channel, ClientTlsConfig}, Request, Status};
 use tonic::codec::CompressionEncoding;
 use google_cloud_auth::project::Config as AuthConfig;
+use prost_types::FieldMask;
 
 use crate::cas_utils::is_zero_digest;
 
@@ -123,6 +124,11 @@ impl GcsClient {
         let mut client = self.inner.lock().await;
         client.update_bucket(req).await
     }
+
+    pub async fn get_object(&self, req: Request<GetObjectRequest>) -> Result<Response<Object>, Status> {
+        let mut client = self.inner.lock().await;
+        client.get_object(req).await
+    }
 }
 
 #[derive(Clone)]
@@ -144,6 +150,7 @@ pub struct GcsStore<NowFn> {
     storage_client: GcsClient,
     now_fn: NowFn,
     bucket: String,
+    key_prefix: String,
     retrier: Retrier,
     consider_expired_after_s: i64,
     max_retry_buffer_per_request: u64,
@@ -220,6 +227,7 @@ where
         Ok(Arc::new(Self {
             storage_client: GcsClient::new(storage_client),
             bucket: spec.bucket.clone(),
+            key_prefix: spec.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
             retrier: Retrier::new(
                 Arc::new(|duration| Box::pin(sleep(duration))),
                 jitter_fn,
@@ -253,6 +261,70 @@ where
         
         let response = self.storage_client.get_bucket(req).await?;
         Ok(response.into_inner())
+    }
+
+    fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
+        format!("{}{}", self.key_prefix, key.as_str(),)
+    }
+
+    pub async fn has(self: Pin<&Self>, digest: &StoreKey<'_>) -> Result<Option<u64>, Error> {
+        self.retrier
+            .retry(unfold((), move |state| async move {
+                // Assume make_gcs_path is analogous to make_s3_path.
+                let gcs_path = self.make_gcs_path(&digest.borrow());
+                let request = GetObjectRequest {
+                    if_metageneration_match: None,
+                    if_metageneration_not_match: None,
+                    bucket: self.bucket.clone(),
+                    object: gcs_path.clone(),
+                    generation: 0, // or leave unset if appropriate
+                    if_generation_match: None,
+                    if_generation_not_match: None,
+                    read_mask: Some(prost_types::FieldMask { paths: vec!["size".to_string(), "update_time".to_string()] }),
+                    common_object_request_params: None,
+                    soft_deleted: None,
+                    restore_token: "".to_string(),
+                };
+                let mut req = Request::new(request);
+                req.metadata_mut().insert(
+                    "x-goog-request-params",
+                    format!("bucket={}&object={}", self.bucket, gcs_path).parse().unwrap(),
+                );
+                let result = self.storage_client.get_object(req).await;
+                match result {
+                    Ok(response) => {
+                        let object = response.into_inner();
+                        if self.consider_expired_after_s != 0 {
+                            if let Some(last_modified) = object.update_time {
+                                let now_s = (self.now_fn)().unix_timestamp() as i64;
+                                if last_modified.seconds + self.consider_expired_after_s <= now_s {
+                                    return Some((RetryResult::Ok(None), state));
+                                }
+                            }
+                        }
+                        let length = object.size;
+                        if length >= 0 {
+                            return Some((RetryResult::Ok(Some(length as u64)), state));
+                        }
+                        Some((
+                            RetryResult::Err(make_err!(
+                                Code::InvalidArgument,
+                                "Negative content length in GCS: {length:?}",
+                            )),
+                            state,                                
+                        ))
+                    }
+                    Err(gcs_error) => match gcs_error.code() {
+                         tonic::Code::NotFound =>
+                            Some((RetryResult::Ok(None), state)),
+                        other => Some((RetryResult::Retry(make_err!(
+                            Code::Unavailable,
+                            "Unhandled GetObjectError in GCS: {other:?}"
+                        )), state)),
+                    },
+                }
+            }))
+            .await
     }
 }
 
@@ -299,386 +371,386 @@ where
             .await
     }
 
-    async fn update(
-        self: Pin<&Self>,
-        digest: StoreKey<'_>,
-        mut reader: DropCloserReadHalf,
-        upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        let s3_path = &self.make_s3_path(&digest.borrow());
+    // async fn update(
+    //     self: Pin<&Self>,
+    //     digest: StoreKey<'_>,
+    //     mut reader: DropCloserReadHalf,
+    //     upload_size: UploadSizeInfo,
+    // ) -> Result<(), Error> {
+    //     let s3_path = &self.make_s3_path(&digest.borrow());
 
-        let max_size = match upload_size {
-            UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
-        };
+    //     let max_size = match upload_size {
+    //         UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
+    //     };
 
-        // Note(allada) It might be more optimal to use a different
-        // heuristic here, but for simplicity we use a hard coded value.
-        // Anything going down this if-statement will have the advantage of only
-        // 1 network request for the upload instead of minimum of 3 required for
-        // multipart upload requests.
-        //
-        // Note(allada) If the upload size is not known, we go down the multipart upload path.
-        // This is not very efficient, but it greatly reduces the complexity of the code.
-        if max_size < MIN_MULTIPART_SIZE && matches!(upload_size, UploadSizeInfo::ExactSize(_)) {
-            let UploadSizeInfo::ExactSize(sz) = upload_size else {
-                unreachable!("upload_size must be UploadSizeInfo::ExactSize here");
-            };
-            reader.set_max_recent_data_size(
-                u64::try_from(self.max_retry_buffer_per_request)
-                    .err_tip(|| "Could not convert max_retry_buffer_per_request to u64")?,
-            );
-            return self
-                .retrier
-                .retry(unfold(reader, move |mut reader| async move {
-                    // We need to make a new pair here because the aws sdk does not give us
-                    // back the body after we send it in order to retry.
-                    let (mut tx, rx) = make_buf_channel_pair();
+    //     // Note(allada) It might be more optimal to use a different
+    //     // heuristic here, but for simplicity we use a hard coded value.
+    //     // Anything going down this if-statement will have the advantage of only
+    //     // 1 network request for the upload instead of minimum of 3 required for
+    //     // multipart upload requests.
+    //     //
+    //     // Note(allada) If the upload size is not known, we go down the multipart upload path.
+    //     // This is not very efficient, but it greatly reduces the complexity of the code.
+    //     if max_size < MIN_MULTIPART_SIZE && matches!(upload_size, UploadSizeInfo::ExactSize(_)) {
+    //         let UploadSizeInfo::ExactSize(sz) = upload_size else {
+    //             unreachable!("upload_size must be UploadSizeInfo::ExactSize here");
+    //         };
+    //         reader.set_max_recent_data_size(
+    //             u64::try_from(self.max_retry_buffer_per_request)
+    //                 .err_tip(|| "Could not convert max_retry_buffer_per_request to u64")?,
+    //         );
+    //         return self
+    //             .retrier
+    //             .retry(unfold(reader, move |mut reader| async move {
+    //                 // We need to make a new pair here because the aws sdk does not give us
+    //                 // back the body after we send it in order to retry.
+    //                 let (mut tx, rx) = make_buf_channel_pair();
 
-                    // Upload the data to the S3 backend.
-                    let result = {
-                        let reader_ref = &mut reader;
-                        let (upload_res, bind_res) = tokio::join!(
-                            self.s3_client
-                                .put_object()
-                                .bucket(&self.bucket)
-                                .key(s3_path.clone())
-                                .content_length(sz as i64)
-                                .body(ByteStream::from_body_1_x(BodyWrapper {
-                                    reader: rx,
-                                    size: sz,
-                                }))
-                                .send()
-                                .map_ok_or_else(|e| Err(make_err!(Code::Aborted, "{e:?}")), |_| Ok(())),
-                            // Stream all data from the reader channel to the writer channel.
-                            tx.bind_buffered(reader_ref)
-                        );
-                        upload_res
-                            .merge(bind_res)
-                            .err_tip(|| "Failed to upload file to s3 in single chunk")
-                    };
+    //                 // Upload the data to the S3 backend.
+    //                 let result = {
+    //                     let reader_ref = &mut reader;
+    //                     let (upload_res, bind_res) = tokio::join!(
+    //                         self.s3_client
+    //                             .put_object()
+    //                             .bucket(&self.bucket)
+    //                             .key(s3_path.clone())
+    //                             .content_length(sz as i64)
+    //                             .body(ByteStream::from_body_1_x(BodyWrapper {
+    //                                 reader: rx,
+    //                                 size: sz,
+    //                             }))
+    //                             .send()
+    //                             .map_ok_or_else(|e| Err(make_err!(Code::Aborted, "{e:?}")), |_| Ok(())),
+    //                         // Stream all data from the reader channel to the writer channel.
+    //                         tx.bind_buffered(reader_ref)
+    //                     );
+    //                     upload_res
+    //                         .merge(bind_res)
+    //                         .err_tip(|| "Failed to upload file to s3 in single chunk")
+    //                 };
 
-                    // If we failed to upload the file, check to see if we can retry.
-                    let retry_result = result.map_or_else(|mut err| {
-                        // Ensure our code is Code::Aborted, so the client can retry if possible.
-                        err.code = Code::Aborted;
-                        let bytes_received = reader.get_bytes_received();
-                        if let Err(try_reset_err) = reader.try_reset_stream() {
-                            event!(
-                                Level::ERROR,
-                                ?bytes_received,
-                                err = ?try_reset_err,
-                                "Unable to reset stream after failed upload in S3Store::update"
-                            );
-                            return RetryResult::Err(err
-                                .merge(try_reset_err)
-                                .append(format!("Failed to retry upload with {bytes_received} bytes received in S3Store::update")));
-                        }
-                        let err = err.append(format!("Retry on upload happened with {bytes_received} bytes received in S3Store::update"));
-                        event!(
-                            Level::INFO,
-                            ?err,
-                            ?bytes_received,
-                            "Retryable S3 error"
-                        );
-                        RetryResult::Retry(err)
-                    }, |()| RetryResult::Ok(()));
-                    Some((retry_result, reader))
-                }))
-                .await;
-        }
+    //                 // If we failed to upload the file, check to see if we can retry.
+    //                 let retry_result = result.map_or_else(|mut err| {
+    //                     // Ensure our code is Code::Aborted, so the client can retry if possible.
+    //                     err.code = Code::Aborted;
+    //                     let bytes_received = reader.get_bytes_received();
+    //                     if let Err(try_reset_err) = reader.try_reset_stream() {
+    //                         event!(
+    //                             Level::ERROR,
+    //                             ?bytes_received,
+    //                             err = ?try_reset_err,
+    //                             "Unable to reset stream after failed upload in S3Store::update"
+    //                         );
+    //                         return RetryResult::Err(err
+    //                             .merge(try_reset_err)
+    //                             .append(format!("Failed to retry upload with {bytes_received} bytes received in S3Store::update")));
+    //                     }
+    //                     let err = err.append(format!("Retry on upload happened with {bytes_received} bytes received in S3Store::update"));
+    //                     event!(
+    //                         Level::INFO,
+    //                         ?err,
+    //                         ?bytes_received,
+    //                         "Retryable S3 error"
+    //                     );
+    //                     RetryResult::Retry(err)
+    //                 }, |()| RetryResult::Ok(()));
+    //                 Some((retry_result, reader))
+    //             }))
+    //             .await;
+    //     }
 
-        let upload_id = &self
-            .retrier
-            .retry(unfold((), move |()| async move {
-                let retry_result = self
-                    .s3_client
-                    .create_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(s3_path)
-                    .send()
-                    .await
-                    .map_or_else(
-                        |e| {
-                            RetryResult::Retry(make_err!(
-                                Code::Aborted,
-                                "Failed to create multipart upload to s3: {e:?}"
-                            ))
-                        },
-                        |CreateMultipartUploadOutput { upload_id, .. }| {
-                            upload_id.map_or_else(
-                                || {
-                                    RetryResult::Err(make_err!(
-                                        Code::Internal,
-                                        "Expected upload_id to be set by s3 response"
-                                    ))
-                                },
-                                RetryResult::Ok,
-                            )
-                        },
-                    );
-                Some((retry_result, ()))
-            }))
-            .await?;
+    //     let upload_id = &self
+    //         .retrier
+    //         .retry(unfold((), move |()| async move {
+    //             let retry_result = self
+    //                 .s3_client
+    //                 .create_multipart_upload()
+    //                 .bucket(&self.bucket)
+    //                 .key(s3_path)
+    //                 .send()
+    //                 .await
+    //                 .map_or_else(
+    //                     |e| {
+    //                         RetryResult::Retry(make_err!(
+    //                             Code::Aborted,
+    //                             "Failed to create multipart upload to s3: {e:?}"
+    //                         ))
+    //                     },
+    //                     |CreateMultipartUploadOutput { upload_id, .. }| {
+    //                         upload_id.map_or_else(
+    //                             || {
+    //                                 RetryResult::Err(make_err!(
+    //                                     Code::Internal,
+    //                                     "Expected upload_id to be set by s3 response"
+    //                                 ))
+    //                             },
+    //                             RetryResult::Ok,
+    //                         )
+    //                     },
+    //                 );
+    //             Some((retry_result, ()))
+    //         }))
+    //         .await?;
 
-        // S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
-        // 5mb (except last part) and can have up to 10,000 parts.
-        let bytes_per_upload_part =
-            (max_size / (MIN_MULTIPART_SIZE - 1)).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
+    //     // S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
+    //     // 5mb (except last part) and can have up to 10,000 parts.
+    //     let bytes_per_upload_part =
+    //         (max_size / (MIN_MULTIPART_SIZE - 1)).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
 
-        let upload_parts = move || async move {
-            // This will ensure we only have `multipart_max_concurrent_uploads` * `bytes_per_upload_part`
-            // bytes in memory at any given time waiting to be uploaded.
-            let (tx, mut rx) = mpsc::channel(self.multipart_max_concurrent_uploads);
+    //     let upload_parts = move || async move {
+    //         // This will ensure we only have `multipart_max_concurrent_uploads` * `bytes_per_upload_part`
+    //         // bytes in memory at any given time waiting to be uploaded.
+    //         let (tx, mut rx) = mpsc::channel(self.multipart_max_concurrent_uploads);
 
-            let read_stream_fut = async move {
-                let retrier = &Pin::get_ref(self).retrier;
-                // Note: Our break condition is when we reach EOF.
-                for part_number in 1..i32::MAX {
-                    let write_buf = reader
-                        .consume(Some(usize::try_from(bytes_per_upload_part).err_tip(|| "Could not convert bytes_per_upload_part to usize")?))
-                        .await
-                        .err_tip(|| "Failed to read chunk in s3_store")?;
-                    if write_buf.is_empty() {
-                        break; // Reached EOF.
-                    }
+    //         let read_stream_fut = async move {
+    //             let retrier = &Pin::get_ref(self).retrier;
+    //             // Note: Our break condition is when we reach EOF.
+    //             for part_number in 1..i32::MAX {
+    //                 let write_buf = reader
+    //                     .consume(Some(usize::try_from(bytes_per_upload_part).err_tip(|| "Could not convert bytes_per_upload_part to usize")?))
+    //                     .await
+    //                     .err_tip(|| "Failed to read chunk in s3_store")?;
+    //                 if write_buf.is_empty() {
+    //                     break; // Reached EOF.
+    //                 }
 
-                    tx.send(retrier.retry(unfold(
-                        write_buf,
-                        move |write_buf| {
-                            async move {
-                                let retry_result = self
-                                    .s3_client
-                                    .upload_part()
-                                    .bucket(&self.bucket)
-                                    .key(s3_path)
-                                    .upload_id(upload_id)
-                                    .body(ByteStream::new(SdkBody::from(write_buf.clone())))
-                                    .part_number(part_number)
-                                    .send()
-                                    .await
-                                    .map_or_else(
-                                        |e| {
-                                            RetryResult::Retry(make_err!(
-                                                Code::Aborted,
-                                                "Failed to upload part {part_number} in S3 store: {e:?}"
-                                            ))
-                                        },
-                                        |mut response| {
-                                            RetryResult::Ok(
-                                                CompletedPartBuilder::default()
-                                                    // Only set an entity tag if it exists. This saves
-                                                    // 13 bytes per part on the final request if it can
-                                                    // omit the `<ETAG><ETAG/>` string.
-                                                    .set_e_tag(response.e_tag.take())
-                                                    .part_number(part_number)
-                                                    .build(),
-                                            )
-                                        },
-                                    );
-                                Some((retry_result, write_buf))
-                            }
-                        }
-                    ))).await.map_err(|_| make_err!(Code::Internal, "Failed to send part to channel in s3_store"))?;
-                }
-                Result::<_, Error>::Ok(())
-            }.fuse();
+    //                 tx.send(retrier.retry(unfold(
+    //                     write_buf,
+    //                     move |write_buf| {
+    //                         async move {
+    //                             let retry_result = self
+    //                                 .s3_client
+    //                                 .upload_part()
+    //                                 .bucket(&self.bucket)
+    //                                 .key(s3_path)
+    //                                 .upload_id(upload_id)
+    //                                 .body(ByteStream::new(SdkBody::from(write_buf.clone())))
+    //                                 .part_number(part_number)
+    //                                 .send()
+    //                                 .await
+    //                                 .map_or_else(
+    //                                     |e| {
+    //                                         RetryResult::Retry(make_err!(
+    //                                             Code::Aborted,
+    //                                             "Failed to upload part {part_number} in S3 store: {e:?}"
+    //                                         ))
+    //                                     },
+    //                                     |mut response| {
+    //                                         RetryResult::Ok(
+    //                                             CompletedPartBuilder::default()
+    //                                                 // Only set an entity tag if it exists. This saves
+    //                                                 // 13 bytes per part on the final request if it can
+    //                                                 // omit the `<ETAG><ETAG/>` string.
+    //                                                 .set_e_tag(response.e_tag.take())
+    //                                                 .part_number(part_number)
+    //                                                 .build(),
+    //                                         )
+    //                                     },
+    //                                 );
+    //                             Some((retry_result, write_buf))
+    //                         }
+    //                     }
+    //                 ))).await.map_err(|_| make_err!(Code::Internal, "Failed to send part to channel in s3_store"))?;
+    //             }
+    //             Result::<_, Error>::Ok(())
+    //         }.fuse();
 
-            let mut upload_futures = FuturesUnordered::new();
+    //         let mut upload_futures = FuturesUnordered::new();
 
-            let mut completed_parts = Vec::with_capacity(
-                usize::try_from(cmp::min(
-                    MAX_UPLOAD_PARTS as u64,
-                    (max_size / bytes_per_upload_part) + 1,
-                ))
-                .err_tip(|| "Could not convert u64 to usize")?,
-            );
-            tokio::pin!(read_stream_fut);
-            loop {
-                if read_stream_fut.is_terminated() && rx.is_empty() && upload_futures.is_empty() {
-                    break; // No more data to process.
-                }
-                tokio::select! {
-                    result = &mut read_stream_fut => result?, // Return error or wait for other futures.
-                    Some(upload_result) = upload_futures.next() => completed_parts.push(upload_result?),
-                    Some(fut) = rx.recv() => upload_futures.push(fut),
-                }
-            }
+    //         let mut completed_parts = Vec::with_capacity(
+    //             usize::try_from(cmp::min(
+    //                 MAX_UPLOAD_PARTS as u64,
+    //                 (max_size / bytes_per_upload_part) + 1,
+    //             ))
+    //             .err_tip(|| "Could not convert u64 to usize")?,
+    //         );
+    //         tokio::pin!(read_stream_fut);
+    //         loop {
+    //             if read_stream_fut.is_terminated() && rx.is_empty() && upload_futures.is_empty() {
+    //                 break; // No more data to process.
+    //             }
+    //             tokio::select! {
+    //                 result = &mut read_stream_fut => result?, // Return error or wait for other futures.
+    //                 Some(upload_result) = upload_futures.next() => completed_parts.push(upload_result?),
+    //                 Some(fut) = rx.recv() => upload_futures.push(fut),
+    //             }
+    //         }
 
-            // Even though the spec does not require parts to be sorted by number, we do it just in case
-            // there's an S3 implementation that requires it.
-            completed_parts.sort_unstable_by_key(|part| part.part_number);
+    //         // Even though the spec does not require parts to be sorted by number, we do it just in case
+    //         // there's an S3 implementation that requires it.
+    //         completed_parts.sort_unstable_by_key(|part| part.part_number);
 
-            self.retrier
-                .retry(unfold(completed_parts, move |completed_parts| async move {
-                    Some((
-                        self.s3_client
-                            .complete_multipart_upload()
-                            .bucket(&self.bucket)
-                            .key(s3_path)
-                            .multipart_upload(
-                                CompletedMultipartUploadBuilder::default()
-                                    .set_parts(Some(completed_parts.clone()))
-                                    .build(),
-                            )
-                            .upload_id(upload_id)
-                            .send()
-                            .await
-                            .map_or_else(
-                                |e| {
-                                    RetryResult::Retry(make_err!(
-                                        Code::Aborted,
-                                        "Failed to complete multipart upload in S3 store: {e:?}"
-                                    ))
-                                },
-                                |_| RetryResult::Ok(()),
-                            ),
-                        completed_parts,
-                    ))
-                }))
-                .await
-        };
-        // Upload our parts and complete the multipart upload.
-        // If we fail attempt to abort the multipart upload (cleanup).
-        upload_parts()
-            .or_else(move |e| async move {
-                Result::<(), _>::Err(e).merge(
-                    // Note: We don't retry here because this is just a best attempt.
-                    self.s3_client
-                        .abort_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(s3_path)
-                        .upload_id(upload_id)
-                        .send()
-                        .await
-                        .map_or_else(
-                            |e| {
-                                let err = make_err!(
-                                    Code::Aborted,
-                                    "Failed to abort multipart upload in S3 store : {e:?}"
-                                );
-                                event!(Level::INFO, ?err, "Multipart upload error");
-                                Err(err)
-                            },
-                            |_| Ok(()),
-                        ),
-                )
-            })
-            .await
-    }
+    //         self.retrier
+    //             .retry(unfold(completed_parts, move |completed_parts| async move {
+    //                 Some((
+    //                     self.s3_client
+    //                         .complete_multipart_upload()
+    //                         .bucket(&self.bucket)
+    //                         .key(s3_path)
+    //                         .multipart_upload(
+    //                             CompletedMultipartUploadBuilder::default()
+    //                                 .set_parts(Some(completed_parts.clone()))
+    //                                 .build(),
+    //                         )
+    //                         .upload_id(upload_id)
+    //                         .send()
+    //                         .await
+    //                         .map_or_else(
+    //                             |e| {
+    //                                 RetryResult::Retry(make_err!(
+    //                                     Code::Aborted,
+    //                                     "Failed to complete multipart upload in S3 store: {e:?}"
+    //                                 ))
+    //                             },
+    //                             |_| RetryResult::Ok(()),
+    //                         ),
+    //                     completed_parts,
+    //                 ))
+    //             }))
+    //             .await
+    //     };
+    //     // Upload our parts and complete the multipart upload.
+    //     // If we fail attempt to abort the multipart upload (cleanup).
+    //     upload_parts()
+    //         .or_else(move |e| async move {
+    //             Result::<(), _>::Err(e).merge(
+    //                 // Note: We don't retry here because this is just a best attempt.
+    //                 self.s3_client
+    //                     .abort_multipart_upload()
+    //                     .bucket(&self.bucket)
+    //                     .key(s3_path)
+    //                     .upload_id(upload_id)
+    //                     .send()
+    //                     .await
+    //                     .map_or_else(
+    //                         |e| {
+    //                             let err = make_err!(
+    //                                 Code::Aborted,
+    //                                 "Failed to abort multipart upload in S3 store : {e:?}"
+    //                             );
+    //                             event!(Level::INFO, ?err, "Multipart upload error");
+    //                             Err(err)
+    //                         },
+    //                         |_| Ok(()),
+    //                     ),
+    //             )
+    //         })
+    //         .await
+    // }
 
-    async fn get_part(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        writer: &mut DropCloserWriteHalf,
-        offset: u64,
-        length: Option<u64>,
-    ) -> Result<(), Error> {
-        if is_zero_digest(key.borrow()) {
-            writer
-                .send_eof()
-                .err_tip(|| "Failed to send zero EOF in filesystem store get_part")?;
-            return Ok(());
-        }
+    // async fn get_part(
+    //     self: Pin<&Self>,
+    //     key: StoreKey<'_>,
+    //     writer: &mut DropCloserWriteHalf,
+    //     offset: u64,
+    //     length: Option<u64>,
+    // ) -> Result<(), Error> {
+    //     if is_zero_digest(key.borrow()) {
+    //         writer
+    //             .send_eof()
+    //             .err_tip(|| "Failed to send zero EOF in filesystem store get_part")?;
+    //         return Ok(());
+    //     }
 
-        let s3_path = &self.make_s3_path(&key);
-        let end_read_byte = length
-            .map_or(Some(None), |length| Some(offset.checked_add(length)))
-            .err_tip(|| "Integer overflow protection triggered")?;
+    //     let s3_path = &self.make_s3_path(&key);
+    //     let end_read_byte = length
+    //         .map_or(Some(None), |length| Some(offset.checked_add(length)))
+    //         .err_tip(|| "Integer overflow protection triggered")?;
 
-        self.retrier
-            .retry(unfold(writer, move |writer| async move {
-                let result = self
-                    .s3_client
-                    .get_object()
-                    .bucket(&self.bucket)
-                    .key(s3_path)
-                    .range(format!(
-                        "bytes={}-{}",
-                        offset + writer.get_bytes_written(),
-                        end_read_byte.map_or_else(String::new, |v| v.to_string())
-                    ))
-                    .send()
-                    .await;
+    //     self.retrier
+    //         .retry(unfold(writer, move |writer| async move {
+    //             let result = self
+    //                 .s3_client
+    //                 .get_object()
+    //                 .bucket(&self.bucket)
+    //                 .key(s3_path)
+    //                 .range(format!(
+    //                     "bytes={}-{}",
+    //                     offset + writer.get_bytes_written(),
+    //                     end_read_byte.map_or_else(String::new, |v| v.to_string())
+    //                 ))
+    //                 .send()
+    //                 .await;
 
-                let mut s3_in_stream = match result {
-                    Ok(head_object_output) => head_object_output.body,
-                    Err(sdk_error) => match sdk_error.into_service_error() {
-                        GetObjectError::NoSuchKey(e) => {
-                            return Some((
-                                RetryResult::Err(make_err!(
-                                    Code::NotFound,
-                                    "No such key in S3: {e}"
-                                )),
-                                writer,
-                            ));
-                        }
-                        other => {
-                            return Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::Unavailable,
-                                    "Unhandled GetObjectError in S3: {other:?}",
-                                )),
-                                writer,
-                            ));
-                        }
-                    },
-                };
+    //             let mut s3_in_stream = match result {
+    //                 Ok(head_object_output) => head_object_output.body,
+    //                 Err(sdk_error) => match sdk_error.into_service_error() {
+    //                     GetObjectError::NoSuchKey(e) => {
+    //                         return Some((
+    //                             RetryResult::Err(make_err!(
+    //                                 Code::NotFound,
+    //                                 "No such key in S3: {e}"
+    //                             )),
+    //                             writer,
+    //                         ));
+    //                     }
+    //                     other => {
+    //                         return Some((
+    //                             RetryResult::Retry(make_err!(
+    //                                 Code::Unavailable,
+    //                                 "Unhandled GetObjectError in S3: {other:?}",
+    //                             )),
+    //                             writer,
+    //                         ));
+    //                     }
+    //                 },
+    //             };
 
-                // Copy data from s3 input stream to the writer stream.
-                while let Some(maybe_bytes) = s3_in_stream.next().await {
-                    match maybe_bytes {
-                        Ok(bytes) => {
-                            if bytes.is_empty() {
-                                // Ignore possible EOF. Different implimentations of S3 may or may not
-                                // send EOF this way.
-                                continue;
-                            }
-                            if let Err(e) = writer.send(bytes).await {
-                                return Some((
-                                    RetryResult::Err(make_err!(
-                                        Code::Aborted,
-                                        "Error sending bytes to consumer in S3: {e}"
-                                    )),
-                                    writer,
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            return Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::Aborted,
-                                    "Bad bytestream element in S3: {e}"
-                                )),
-                                writer,
-                            ));
-                        }
-                    }
-                }
-                if let Err(e) = writer.send_eof() {
-                    return Some((
-                        RetryResult::Err(make_err!(
-                            Code::Aborted,
-                            "Failed to send EOF to consumer in S3: {e}"
-                        )),
-                        writer,
-                    ));
-                }
-                Some((RetryResult::Ok(()), writer))
-            }))
-            .await
-    }
+    //             // Copy data from s3 input stream to the writer stream.
+    //             while let Some(maybe_bytes) = s3_in_stream.next().await {
+    //                 match maybe_bytes {
+    //                     Ok(bytes) => {
+    //                         if bytes.is_empty() {
+    //                             // Ignore possible EOF. Different implimentations of S3 may or may not
+    //                             // send EOF this way.
+    //                             continue;
+    //                         }
+    //                         if let Err(e) = writer.send(bytes).await {
+    //                             return Some((
+    //                                 RetryResult::Err(make_err!(
+    //                                     Code::Aborted,
+    //                                     "Error sending bytes to consumer in S3: {e}"
+    //                                 )),
+    //                                 writer,
+    //                             ));
+    //                         }
+    //                     }
+    //                     Err(e) => {
+    //                         return Some((
+    //                             RetryResult::Retry(make_err!(
+    //                                 Code::Aborted,
+    //                                 "Bad bytestream element in S3: {e}"
+    //                             )),
+    //                             writer,
+    //                         ));
+    //                     }
+    //                 }
+    //             }
+    //             if let Err(e) = writer.send_eof() {
+    //                 return Some((
+    //                     RetryResult::Err(make_err!(
+    //                         Code::Aborted,
+    //                         "Failed to send EOF to consumer in S3: {e}"
+    //                     )),
+    //                     writer,
+    //                 ));
+    //             }
+    //             Some((RetryResult::Ok(()), writer))
+    //         }))
+    //         .await
+    // }
 
-    fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
-        self
-    }
+//     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+//         self
+//     }
 
-    fn as_any<'a>(&'a self) -> &'a (dyn std::any::Any + Sync + Send + 'static) {
-        self
-    }
+//     fn as_any<'a>(&'a self) -> &'a (dyn std::any::Any + Sync + Send + 'static) {
+//         self
+//     }
 
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Sync + Send + 'static> {
-        self
-    }
+//     fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Sync + Send + 'static> {
+//         self
+//     }
 }
 
 #[cfg(test)]
