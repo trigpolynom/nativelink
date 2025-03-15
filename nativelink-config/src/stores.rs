@@ -816,6 +816,9 @@ pub struct GcsSpec {
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub bucket: String,
 
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+
     /// GCS endpoint. Default: "https://storage.googleapis.com"
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub endpoint: String,
@@ -830,10 +833,6 @@ pub struct GcsSpec {
 
     #[serde(default)]
     pub use_id_token: bool,
-
-    /// If you wish to prefix the location. If None, no prefix will be used.
-    #[serde(default)]
-    pub key_prefix: Option<String>,
 
     /// Connection timeout in seconds.
     #[serde(default)]
